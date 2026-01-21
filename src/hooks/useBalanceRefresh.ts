@@ -1,0 +1,197 @@
+import { useEffect, useRef, useCallback } from 'react';
+import { useWalletStore } from '@/stores/walletStore';
+import { getAllChainBalances } from '@/lib/blockchainService';
+import { fetchPricesByIds } from '@/lib/priceService';
+import { EVM_TOKENS, SOLANA_TOKENS } from '@/lib/tokenLists';
+
+// Map chain names to their native token CoinGecko IDs
+const NATIVE_TOKEN_IDS: Record<string, string> = {
+  ethereum: 'ethereum',
+  polygon: 'matic-network',
+  arbitrum: 'ethereum',
+  optimism: 'ethereum',
+  base: 'ethereum',
+  bsc: 'binancecoin',
+  avalanche: 'avalanche-2',
+  solana: 'solana',
+};
+
+// Map token symbols to CoinGecko IDs - expanded for Solana
+const SYMBOL_TO_COINGECKO: Record<string, string> = {
+  ETH: 'ethereum',
+  WETH: 'weth',
+  MATIC: 'matic-network',
+  BNB: 'binancecoin',
+  AVAX: 'avalanche-2',
+  SOL: 'solana',
+  WSOL: 'solana',
+  USDT: 'tether',
+  USDC: 'usd-coin',
+  DAI: 'dai',
+  WBTC: 'wrapped-bitcoin',
+  LINK: 'chainlink',
+  AAVE: 'aave',
+  UNI: 'uniswap',
+  ARB: 'arbitrum',
+  OP: 'optimism',
+  mSOL: 'marinade-staked-sol',
+  stSOL: 'lido-staked-sol',
+  BONK: 'bonk',
+  JUP: 'jupiter-exchange-solana',
+  PYTH: 'pyth-network',
+  ORCA: 'orca',
+  WIF: 'dogwifcoin',
+  JTO: 'jito-governance-token',
+  RAY: 'raydium',
+  RENDER: 'render-token',
+};
+
+export function useBalanceRefresh(intervalMs: number = 12000) {
+  const { connectedWallets, updateWalletBalances, setTotalPortfolioUSD, setLastUpdated, setLoading } = useWalletStore();
+  const intervalRef = useRef<NodeJS.Timeout | null>(null);
+  const isRefreshingRef = useRef(false);
+  const isVisibleRef = useRef(true);
+  const abortControllerRef = useRef<AbortController | null>(null);
+
+  const refreshAllWallets = useCallback(async () => {
+    // Only refresh if page is visible and not already refreshing
+    if (connectedWallets.length === 0 || isRefreshingRef.current || !isVisibleRef.current) return;
+    
+    // Cancel any previous refresh
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
+    abortControllerRef.current = new AbortController();
+    
+    isRefreshingRef.current = true;
+    setLoading(true);
+    const startTime = Date.now();
+    console.log('🔄 Refreshing balances for', connectedWallets.length, 'wallet(s)...');
+
+    try {
+      // Refresh all wallets in parallel for speed
+      const refreshPromises = connectedWallets.map(async (wallet) => {
+        try {
+          const balances = await getAllChainBalances(wallet.address, wallet.type);
+          
+          // Collect all unique CoinGecko IDs
+          const coingeckoIds = new Set<string>();
+          
+          balances.forEach((token) => {
+            if (!token.contractAddress) {
+              const nativeId = NATIVE_TOKEN_IDS[token.chain];
+              if (nativeId) coingeckoIds.add(nativeId);
+            } else if (token.chain === 'solana') {
+              const info = SOLANA_TOKENS.find((t) => t.address === token.contractAddress);
+              if (info?.coingeckoId) coingeckoIds.add(info.coingeckoId);
+            } else {
+              const chainTokens = EVM_TOKENS[token.chain];
+              const info = chainTokens?.find((t) => t.address.toLowerCase() === token.contractAddress?.toLowerCase());
+              if (info?.coingeckoId) coingeckoIds.add(info.coingeckoId);
+            }
+            
+            const symbolId = SYMBOL_TO_COINGECKO[token.symbol.toUpperCase()];
+            if (symbolId) coingeckoIds.add(symbolId);
+          });
+
+          const prices = coingeckoIds.size > 0 ? await fetchPricesByIds(Array.from(coingeckoIds)) : {};
+
+          // Update balances with USD values
+          const balancesWithPrices = balances.map((token) => {
+            let priceId: string | undefined;
+            
+            if (!token.contractAddress) {
+              priceId = NATIVE_TOKEN_IDS[token.chain];
+            } else if (token.chain === 'solana') {
+              const info = SOLANA_TOKENS.find((t) => t.address === token.contractAddress);
+              priceId = info?.coingeckoId;
+            } else {
+              const chainTokens = EVM_TOKENS[token.chain];
+              const info = chainTokens?.find((t) => t.address.toLowerCase() === token.contractAddress?.toLowerCase());
+              priceId = info?.coingeckoId;
+            }
+            
+            if (!priceId || !prices[priceId]) {
+              priceId = SYMBOL_TO_COINGECKO[token.symbol.toUpperCase()];
+            }
+
+            const price = priceId ? (prices[priceId] || 0) : 0;
+            const balanceNum = parseFloat(token.balance) || 0;
+            
+            return {
+              ...token,
+              priceUsd: price,
+              usdValue: balanceNum * price
+            };
+          });
+
+          updateWalletBalances(wallet.id, balancesWithPrices);
+          return { success: true, walletId: wallet.id };
+        } catch (error) {
+          console.error(`❌ Failed to refresh wallet ${wallet.name}:`, error);
+          return { success: false, walletId: wallet.id, error };
+        }
+      });
+
+      await Promise.allSettled(refreshPromises);
+
+      // Recalculate total portfolio value
+      const store = useWalletStore.getState();
+      const totalUSD = store.connectedWallets.reduce((sum, w) => sum + w.totalUsdValue, 0);
+      setTotalPortfolioUSD(totalUSD);
+      setLastUpdated(Date.now());
+
+      const elapsed = Date.now() - startTime;
+      console.log(`✅ Balance refresh complete in ${elapsed}ms. Total: $${totalUSD.toFixed(2)}`);
+    } catch (error) {
+      console.error('❌ Failed to refresh balances:', error);
+    } finally {
+      isRefreshingRef.current = false;
+      setLoading(false);
+    }
+  }, [connectedWallets, updateWalletBalances, setTotalPortfolioUSD, setLastUpdated, setLoading]);
+
+  // Handle page visibility changes
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      isVisibleRef.current = document.visibilityState === 'visible';
+      
+      // Refresh immediately when becoming visible
+      if (isVisibleRef.current && connectedWallets.length > 0) {
+        refreshAllWallets();
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
+  }, [connectedWallets.length, refreshAllWallets]);
+
+  useEffect(() => {
+    if (connectedWallets.length === 0) {
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+        intervalRef.current = null;
+      }
+      return;
+    }
+
+    // Refresh immediately on mount/wallet change
+    refreshAllWallets();
+
+    // Set up interval for auto-refresh (12 seconds default)
+    intervalRef.current = setInterval(refreshAllWallets, intervalMs);
+
+    // Cleanup on unmount
+    return () => {
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+        intervalRef.current = null;
+      }
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+      }
+    };
+  }, [connectedWallets.length, intervalMs, refreshAllWallets]);
+
+  return { refreshAllWallets };
+}
